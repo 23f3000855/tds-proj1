@@ -1,244 +1,312 @@
-
 import os
 import json
+import re
 import subprocess
 import time
+import base64
+import shutil
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from openai import OpenAI
 
+# Load environment variables (you can also hardcode for testing)
 load_dotenv()
 
-MY_SECRET = os.getenv("MY_SECRET")
+# Use the given secret or from env
+MY_SECRET = os.getenv("MY_SECRET", "well-that-is-a-secret")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GITHUB_USER = os.getenv("GITHUB_USER")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
+# Validate GitHub config
+if not GITHUB_USER or not GITHUB_TOKEN:
+    raise RuntimeError("GITHUB_USER and GITHUB_TOKEN must be set")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
+# Setup OpenAI client if available
+try:
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    OPENAI_SDK_PRESENT = True
+except ImportError:
+    client = None
+    OPENAI_SDK_PRESENT = False
 
 app = Flask(__name__)
 
 
 @app.route('/api/build', methods=['POST'])
 def handle_build_request():
-    
-    data = request.get_json()
-    if not data or data.get('secret') != MY_SECRET:
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "Invalid JSON"}), 400
+    if data.get('secret') != MY_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
-    print(f"Received valid request for task: {data.get('task')}, round: {data.get('round')}")
-    process_task(data)
 
-    return jsonify({"message": "Request received and is being processed."}), 200
+    # required fields
+    for fld in ("email", "task", "round", "nonce", "brief", "evaluation_url"):
+        if fld not in data:
+            return jsonify({"error": f"Missing {fld}"}), 400
 
+    print(f"[Task={data['task']}] Valid request received (round={data['round']})")
+    try:
+        process_task(data)
+    except Exception as e:
+        # We still return 200 per spec, but log error
+        print(f"[Task={data['task']}] Error: {e}")
+
+    return jsonify({"message": "Received"}), 200
 
 
 def process_task(data):
-    """
-    Handles the main logic: generate code, deploy, and notify.
-    """
-    task_id = data['task']
-    round_num = data['round']
+    task = data['task']
+    round_num = int(data['round'])
     brief = data['brief']
     attachments = data.get('attachments', [])
-    repo_name = task_id 
-    repo_path = os.path.join('/tmp', repo_name) 
+    repo_name = "tds-proj1"  # fixed to your project
+    repo_path = os.path.join("/tmp", repo_name)
 
-    print(f"[{task_id}] Starting round {round_num}...")
+    print(f"[{task}] Processing round {round_num}")
 
+    # decode attachments
+    attachments_dir = None
+    if attachments:
+        attachments_dir = os.path.join("/tmp", f"{repo_name}-attachments")
+        if os.path.exists(attachments_dir):
+            shutil.rmtree(attachments_dir)
+        os.makedirs(attachments_dir, exist_ok=True)
+        for att in attachments:
+            name = att.get("name")
+            url = att.get("url")
+            if name and url:
+                if url.startswith("data:"):
+                    _, b64 = url.split(",", 1)
+                    content = base64.b64decode(b64)
+                    with open(os.path.join(attachments_dir, name), "wb") as f:
+                        f.write(content)
+                else:
+                    # try HTTP fetch
+                    try:
+                        r = requests.get(url, timeout=10)
+                        r.raise_for_status()
+                        with open(os.path.join(attachments_dir, name), "wb") as f:
+                            f.write(r.content)
+                    except Exception as e:
+                        print(f"[{task}] Warning: failed to fetch attachment {name}: {e}")
+
+    # Generate or update code
+    generated = generate_code_with_llm(brief, attachments, existing_repo_path=(repo_path if round_num > 1 else None))
+    if not generated:
+        raise RuntimeError("Failed to generate code from LLM")
+
+    # Clean old clone
+    if os.path.exists(repo_path):
+        shutil.rmtree(repo_path)
+    os.makedirs(repo_path, exist_ok=True)
+
+    # Write files
+    for fi in generated:
+        fname = fi.get("name")
+        content = fi.get("content", "")
+        target = os.path.join(repo_path, fname)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    # Ensure LICENSE (MIT) exists
+    licpath = os.path.join(repo_path, "LICENSE")
+    if not os.path.exists(licpath):
+        year = time.gmtime().tm_year
+        mit = f"""MIT License
+
+Copyright (c) {year} {GITHUB_USER}
+
+Permission is hereby granted...
+"""
+        with open(licpath, "w", encoding="utf-8") as f:
+            f.write(mit)
+
+    # Git init / commit
+    run_cmd(['git', 'init'], repo_path)
+    run_cmd(['git', 'checkout', '-b', 'main'], repo_path)
+    run_cmd(['git', 'add', '.'], repo_path)
+    run_cmd(['git', 'commit', '-m', f"Round {round_num} commit"], repo_path)
+
+    # remote URL with token
+    remote = f'https://{GITHUB_USER}:{GITHUB_TOKEN}@github.com/{GITHUB_USER}/{repo_name}.git'
     try:
-        
-        print(f"[{task_id}] Generating code with LLM...")
-        generated_files = generate_code_with_llm(brief, attachments, repo_path if round_num > 1 else None)
-        if not generated_files:
-            raise Exception("LLM failed to generate files.")
+        run_cmd(['git', 'remote', 'add', 'origin', remote], repo_path)
+    except Exception:
+        run_cmd(['git', 'remote', 'set-url', 'origin', remote], repo_path)
 
-        
-        print(f"[{task_id}] Deploying to GitHub...")
-        if round_num == 1:
-            
-            deploy_new_repo(repo_name, repo_path, generated_files)
-        else:
-            
-            update_existing_repo(repo_name, repo_path, generated_files)
-        
-        
-        commit_sha = subprocess.check_output(['git', '-C', repo_path, 'rev-parse', 'HEAD']).decode().strip()
-        pages_url = f"https://23f3000855.github.io/tds-proj1/"
-        repo_url = f"https://github.com/23f3000855/tds-proj1"
-        
-        print(f"[{task_id}] Deployment successful. Commit: {commit_sha}")
-        print(f"[{task_id}] Pages URL: {pages_url}")
+    run_cmd(['git', 'push', '-u', 'origin', 'main', '--force'], repo_path)
 
-        
-        print(f"[{task_id}] Notifying evaluation server...")
-        notify_evaluator(data, repo_url, commit_sha, pages_url)
-        print(f"[{task_id}] Process completed successfully.")
-
+    # publish pages
+    pages_url = f"https://{GITHUB_USER}.github.io/{repo_name}/"
+    try:
+        run_cmd(['gh', 'pages', 'publish', '--branch', 'main', f'--repo={GITHUB_USER}/{repo_name}'], repo_path)
     except Exception as e:
-        print(f"[{task_id}] An error occurred: {e}")
+        print(f"[{task}] gh pages publish error: {e}")
 
+    # wait for pages
+    ok = wait_for_pages_ok(pages_url, timeout=300)
+    if not ok:
+        print(f"[{task}] Warning: Pages not responding OK after wait")
+
+    # commit SHA
+    commit_sha = run_cmd(['git', 'rev-parse', 'HEAD'], repo_path).strip()
+    repo_url = f"https://github.com/{GITHUB_USER}/{repo_name}"
+
+    print(f"[{task}] Deployed. Commit {commit_sha}, pages {pages_url}")
+
+    # notify evaluator
+    notify_evaluator(data, repo_url, commit_sha, pages_url)
+    print(f"[{task}] Notification sent.")
 
 
 def generate_code_with_llm(brief, attachments, existing_repo_path=None):
-    """
-    Uses an LLM to generate application files based on the brief.
-    For round 2+, it reads existing files to provide context for modifications.
-    """
-    prompt_content = f"You are an expert web developer. Your task is to build a single-page web application based on the following brief.\n\n"
-    prompt_content += f"BRIEF:\n{brief}\n\n"
+    # fallback if no client
+    if client is None:
+        print("No LLM client; returning minimal stub")
+        return [
+            {"name": "index.html", "content": f"<!doctype html><html><body><h1>{brief}</h1></body></html>"},
+            {"name": "README.md", "content": f"# {brief}\n\nAuto-generated stub."},
+            {"name": "LICENSE", "content": "MIT License (placeholder)"}
+        ]
 
+    prompt = f"You are an expert web developer. Here is the brief:\n{brief}\n"
     if attachments:
-        prompt_content += "The following attachments are provided as data URIs:\n"
-        for att in attachments:
-            prompt_content += f"- {att['name']}\n"
-    
-    
+        prompt += "Attachments: " + ", ".join(att.get("name","") for att in attachments) + "\n"
     if existing_repo_path and os.path.exists(existing_repo_path):
-        prompt_content += "\n--- EXISTING CODE ---\n"
-        prompt_content += "You must modify the following existing files. Do not start from scratch.\n"
+        prompt += "You must modify existing code. Show file diffs or full files accordingly.\n"
+        # optionally include some content from existing files (first few lines)
         for root, _, files in os.walk(existing_repo_path):
             if '.git' in root:
                 continue
-            for filename in files:
+            for f in files:
                 try:
-                    with open(os.path.join(root, filename), 'r', encoding='utf-8') as f:
-                        file_content = f.read()
-                        prompt_content += f"\n-- File: {filename} --\n{file_content}\n"
-                except Exception:
-                    pass 
-        prompt_content += "--- END EXISTING CODE ---\n\n"
+                    with open(os.path.join(root, f), 'r', encoding='utf-8', errors='ignore') as fr:
+                        snippet = fr.read(500)
+                        prompt += f"\n-- {f} snippet --\n{snippet}\n"
+                except:
+                    pass
 
-    prompt_content += """
-    INSTRUCTIONS:
-    1.  Generate all necessary code. For simplicity, create a single `index.html` file with inline CSS and JavaScript if possible.
-    2.  Create a professional `README.md` file explaining the project, setup, and usage.
-    3.  Create an `LICENSE` file with the MIT License text.
-    4.  Your response MUST be a JSON object with a single key "files", which is an array of objects. Each object must have two keys: "name" (the filename) and "content" (the file's source code).
-    5.  Do not include any explanations or conversational text outside of the JSON structure.
+    prompt += """
+INSTRUCTIONS:
+Output exactly a JSON object with key "files" whose value is an array of { name, content } objects.
+Include index.html, README.md, LICENSE. No extra text outside JSON.
+"""
 
-    Example JSON output:
-    {
-      "files": [
-        { "name": "index.html", "content": "<!DOCTYPE html>..." },
-        { "name": "README.md", "content": "
-        { "name": "LICENSE", "content": "MIT License..." }
-      ]
-    }
-    """
-    
     try:
-        completion = client.chat.completions.create(
-            model="gpt-4-turbo-preview", 
-            messages=[{"role": "user", "content": prompt_content}],
-            response_format={"type": "json_object"}
-        )
-        response_json = json.loads(completion.choices[0].message.content)
-        return response_json.get("files", [])
+        if hasattr(client, "chat"):
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1500,
+            )
+            raw = resp.choices[0].message.content
+        else:
+            resp = client.responses.create(
+                model="gpt-4o-mini",
+                input=prompt,
+                max_tokens=1500,
+            )
+            raw = getattr(resp, "output_text", str(resp))
+        json_text = extract_json_from_text(raw)
+        if not json_text:
+            json_text = extract_json_from_text(raw, allow_loose=True)
+        parsed = json.loads(json_text)
+        return parsed.get("files", [])
     except Exception as e:
-        print(f"Error calling LLM: {e}")
+        print(f"LLM error or invalid output: {e}")
         return None
-    
 
 
-def run_command(command, working_dir):
-    """Helper to run a shell command and check for errors."""
-    result = subprocess.run(command, cwd=working_dir, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(f"Command failed: {' '.join(command)}\nError: {result.stderr}")
-    return result.stdout.strip()
-
-def deploy_new_repo(repo_name, repo_path, files):
-    """Creates a new GitHub repo, pushes files, and enables GitHub Pages."""
-    
-    if os.path.exists(repo_path):
-        subprocess.run(['rm', '-rf', repo_path])
-    
-    os.makedirs(repo_path)
-
-    
-    for file_info in files:
-        with open(os.path.join(repo_path, file_info['name']), 'w') as f:
-            f.write(file_info['content'])
-
-    
-    try:
-        
-        os.environ['GITHUB_TOKEN'] = GITHUB_TOKEN
-        run_command(['gh', 'repo', 'create', repo_name, '--public', f'--source={repo_path}'], '/tmp')
-    except Exception as e:
-        
-        if "already exists" not in str(e):
-            raise e
-        print(f"Repo {repo_name} already exists. Will overwrite.")
-
-    run_command(['git', 'init'], repo_path)
-    run_command(['git', 'add', '.'], repo_path)
-    run_command(['git', 'commit', '-m', 'Initial commit'], repo_path)
-    run_command(['git', 'branch', '-M', 'main'], repo_path)
-    run_command(['git', 'remote', 'add', 'origin', f'https://23f3000855:GITHUB_TOKEN@github.com/23f3000855/tds-proj1.git'], repo_path)
-    run_command(['git', 'push', '-u', 'origin', 'main', '--force'], repo_path)
-    
-    
-    run_command(['gh', 'pages', 'publish', '--branch', 'main', f'--repo=23f3000855/tds-proj1'], repo_path)
-
-def update_existing_repo(repo_name, repo_path, files):
-    """Clones an existing repo, updates files, and pushes changes."""
-    
-    if os.path.exists(repo_path):
-        subprocess.run(['rm', '-rf', repo_path])
-        
-    
-    run_command(['git', 'clone', clone_url, repo_path], '/tmp')
-
-    
-    for file_info in files:
-        with open(os.path.join(repo_path, file_info['name']), 'w') as f:
-            f.write(file_info['content'])
-            
-    
-    run_command(['git', 'add', '.'], repo_path)
-    
-    run_command(['git', 'commit', '--allow-empty', '-m', 'Apply updates for round 2'], repo_path)
-    run_command(['git', 'push', 'origin', 'main'], repo_path)
+def extract_json_from_text(text, allow_loose=False):
+    if not text:
+        return None
+    # remove fences
+    text = re.sub(r"```(?:json|js|html)?\n?", "", text)
+    text = re.sub(r"```", "", text)
+    # find balanced JSON
+    start_idxs = [m.start() for m in re.finditer(r"\{", text)]
+    for s in start_idxs:
+        stack = 0
+        for i in range(s, len(text)):
+            if text[i] == "{":
+                stack += 1
+            elif text[i] == "}":
+                stack -= 1
+                if stack == 0:
+                    cand = text[s:i+1]
+                    try:
+                        json.loads(cand)
+                        return cand
+                    except:
+                        break
+    if allow_loose:
+        try:
+            cleaned = text.strip()
+            first = min(pos for pos in (cleaned.find('{'), cleaned.find('[')) if pos != -1)
+            last = max(cleaned.rfind('}'), cleaned.rfind(']'))
+            cand = cleaned[first:last+1]
+            json.loads(cand)
+            return cand
+        except:
+            return None
+    return None
 
 
+def run_cmd(cmd, cwd):
+    print(f"Running: {' '.join(cmd)} (cwd={cwd})")
+    res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Command failed: {cmd}\nstderr: {res.stderr}\nstdout: {res.stdout}")
+    return res.stdout.strip()
 
-def notify_evaluator(original_request, repo_url, commit_sha, pages_url):
-    """Sends the result to the evaluation URL with retry logic."""
+
+def wait_for_pages_ok(url, timeout=300):
+    print(f"Waiting for {url} (timeout {timeout}s)")
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            r = requests.get(url, timeout=5)
+            print(f"Status {r.status_code}")
+            if r.status_code == 200:
+                return True
+        except:
+            pass
+        time.sleep(2)
+    return False
+
+
+def notify_evaluator(orig, repo_url, commit_sha, pages_url):
     payload = {
-        "email": original_request['email'],
-        "task": original_request['task'],
-        "round": original_request['round'],
-        "nonce": original_request['nonce'],
+        "email": orig['email'],
+        "task": orig['task'],
+        "round": orig['round'],
+        "nonce": orig['nonce'],
         "repo_url": repo_url,
         "commit_sha": commit_sha,
         "pages_url": pages_url,
     }
-    
-    url = original_request['evaluation_url']
+    url = orig['evaluation_url']
     headers = {'Content-Type': 'application/json'}
-    max_retries = 5
-    delay = 1  
-
-    for attempt in range(max_retries):
+    delay = 1
+    for attempt in range(1, 6):
+        print(f"Notify attempt {attempt} to {url}")
         try:
-            response = requests.post(url, json=payload, headers=headers, timeout=10)
-            if response.status_code == 200:
-                print(f"Successfully notified evaluation server at {url}")
+            r = requests.post(url, json=payload, headers=headers, timeout=10)
+            if r.status_code == 200:
+                print("Evaluator notified successfully")
                 return
             else:
-                print(f"Attempt {attempt + 1}: Failed to notify. Status: {response.status_code}, Body: {response.text}")
-        except requests.exceptions.RequestException as e:
-            print(f"Attempt {attempt + 1}: Error notifying server: {e}")
-
+                print(f"Notify failed status {r.status_code}, body: {r.text}")
+        except Exception as e:
+            print(f"Notify exception {e}")
         time.sleep(delay)
-        delay *= 2 
-    
-    raise Exception("Failed to notify evaluation server after multiple retries.")
+        delay *= 2
+    raise RuntimeError("Failed notifying evaluator after retries.")
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    app.run(host='0.0.0.0', port=5001, debug=True)
